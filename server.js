@@ -14,14 +14,37 @@ const app = express();
 app.use(express.json());
 
 // ---- Config (set these as environment variables on your host) -------------
-const SHOP   = process.env.SHOP   || 'nova-essenceio.myshopify.com';
-const TOKEN  = process.env.ADMIN_API_TOKEN;   // shpat_...  (Admin API access token)
-const SECRET = process.env.APP_PROXY_SECRET;  // App's API secret key (for proxy signature)
-const API_VERSION = '2024-10';
-const API_URL = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+const SHOP   = process.env.SHOP || 'nova-essenceio.myshopify.com';
+const CLIENT_ID     = process.env.CLIENT_ID;      // Dev Dashboard → Settings → Client ID
+const CLIENT_SECRET = process.env.CLIENT_SECRET;  // Dev Dashboard → Settings → Secret
+const API_VERSION = '2026-07';
+const API_URL   = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
+const TOKEN_URL = `https://${SHOP}/admin/oauth/access_token`;
 
-if (!TOKEN || !SECRET) {
-  console.warn('[warn] ADMIN_API_TOKEN and/or APP_PROXY_SECRET not set — requests will fail until they are.');
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.warn('[warn] CLIENT_ID and/or CLIENT_SECRET not set — requests will fail until they are.');
+}
+
+// ---- Access token via client-credentials grant (cached, auto-refresh) -----
+// Dev Dashboard apps don't expose a static shpat_ token; we exchange the
+// client id/secret for a short-lived token (valid ~24h) and cache it.
+let _token = null, _tokenExp = 0;
+async function getToken() {
+  if (_token && Date.now() < _tokenExp - 60000) return _token;   // 1-min safety margin
+  const r = await fetch(TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: 'client_credentials'
+    })
+  });
+  const j = await r.json();
+  if (!j.access_token) throw new Error('token exchange failed: ' + JSON.stringify(j));
+  _token = j.access_token;
+  _tokenExp = Date.now() + ((j.expires_in || 86400) * 1000);
+  return _token;
 }
 
 // ---- Verify the request truly came through Shopify's signed App Proxy ------
@@ -31,7 +54,7 @@ function verifyProxy(query) {
   const message = Object.keys(rest).sort()
     .map(k => `${k}=${Array.isArray(rest[k]) ? rest[k].join(',') : rest[k]}`)
     .join('');
-  const digest = crypto.createHmac('sha256', SECRET).update(message).digest('hex');
+  const digest = crypto.createHmac('sha256', CLIENT_SECRET).update(message).digest('hex');
   try {
     return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
   } catch (_) {
@@ -41,9 +64,10 @@ function verifyProxy(query) {
 
 // ---- Admin GraphQL helper -------------------------------------------------
 async function admin(query, variables) {
+  const token = await getToken();
   const r = await fetch(API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': TOKEN },
+    headers: { 'Content-Type': 'application/json', 'X-Shopify-Access-Token': token },
     body: JSON.stringify({ query, variables })
   });
   return r.json();

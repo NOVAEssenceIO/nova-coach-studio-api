@@ -24,8 +24,8 @@ Shopify admin → **Settings → Apps and sales channels → Develop apps → Cr
 
 **Admin API scopes:** `read_metaobjects`, `write_metaobjects`, `read_customers`
 
-Install → reveal the **Admin API access token** (`shpat_…`).
-Under **API credentials**, copy the **API secret key**.
+Install → then open **Settings → Credentials** and copy the **Client ID** and
+**Secret**. (This app type does **not** issue a `shpat_` token — that's normal.)
 
 ## 2. Add the App Proxy
 
@@ -49,13 +49,18 @@ Any Node 18+ host (Render, Railway, Fly, Vercel). Example (Render):
 
 1. Push this folder to a GitHub repo.
 2. New **Web Service** → build `npm install`, start `npm start`.
-3. Set environment variables:
+3. Set environment variables (from Dev Dashboard → your app → **Settings → Credentials**):
 
 ```
 SHOP=nova-essenceio.myshopify.com
-ADMIN_API_TOKEN=shpat_xxxxxxxxxxxxxxxx
-APP_PROXY_SECRET=xxxxxxxxxxxxxxxx
+CLIENT_ID=your_dev_dashboard_client_id
+CLIENT_SECRET=your_dev_dashboard_secret
 ```
+
+> **No `shpat_` token needed.** Dev Dashboard apps don't expose a static
+> Admin API token. The server exchanges your Client ID + Secret for a
+> short-lived token (client-credentials grant, auto-refreshed every ~24h).
+> This works because the app and store are in the same Shopify organization.
 
 4. Put the service's public URL into the App Proxy **Proxy URL** (step 2).
 
