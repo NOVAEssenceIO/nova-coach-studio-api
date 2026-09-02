@@ -112,7 +112,8 @@ async function listMetaobjects(type) {
 
 async function findByCustomer(type, gid) {
   const all = await listMetaobjects(type);
-  return all.find(m => m.fields.customer === gid) || null;
+  const numericId = String(gid).split('/').pop();
+  return all.find(m => m.fields.customer === gid || m.fields.customer_id === numericId) || null;
 }
 
 async function getCustomerName(gid) {
@@ -190,6 +191,7 @@ app.post('/proxy/coach/member-save', async (req, res) => {
       errs = await updateMetaobject(existing.id, fields);
     } else {
       fields.push({ key: 'customer', value: gid });
+      fields.push({ key: 'customer_id', value: String(gid).split('/').pop() });
       errs = await createMetaobject('member_profile', fields);
     }
     if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
