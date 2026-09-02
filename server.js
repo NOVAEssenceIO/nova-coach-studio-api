@@ -160,7 +160,7 @@ app.post('/proxy/coach/save', async (req, res) => {
   const gid = guard(req, res); if (!gid) return;
   try {
     const node = await findByCustomer('coach', gid);
-    if (!node) return res.status(403).json({ error: 'no coach record linked to your account. In Shopify admin → Custom data → coach, set the entry\'s customer field to you.' });
+    if (!node) return res.status(403).json({ error: 'no coach record linked to your account. In Shopify admin → Custom data → coach, set the entry\'s customer_id field to ' + String(gid).split('/').pop() });
 
     const allowed = ['name', 'title', 'photo_url', 'bio', 'booking_url'];
     const fields = allowed.filter(k => k in req.body)
