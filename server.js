@@ -1021,16 +1021,28 @@ app.post('/proxy/coach/intake', async (req, res) => {
 //  last_booking_click. Needs client_assignment fields: customer_id, source,
 //  last_booking_click (single line text).
 // ==========================================================================
+async function createAssignment(fields, publishable) {
+  const mo = publishable
+    ? `metaobject:{type:"client_assignment", fields:$fields, capabilities:{publishable:{status:ACTIVE}}}`
+    : `metaobject:{type:"client_assignment", fields:$fields}`;
+  const j = await admin(`mutation($fields:[MetaobjectFieldInput!]!){ metaobjectCreate(${mo}){ userErrors{field message} } }`, { fields });
+  if (!j.data) return [{ message: 'unexpected: ' + JSON.stringify(j.errors || j).slice(0, 300) }];
+  return j.data.metaobjectCreate?.userErrors || [];
+}
+
 const TIER_BY_TAG = [['nourished_membership', 'Nourished'], ['empowered_membership', 'Empowered'], ['villager_membership', 'Villager']];
 
 app.post('/proxy/coach/book-click', async (req, res) => {
   const gid = guard(req, res); if (!gid) return;
   try {
-    const coachId = String(req.body.coach || '');
-    if (!coachId.startsWith('gid://shopify/Metaobject/')) return res.status(400).json({ error: 'missing coach' });
+    let coachId = String(req.body.coach || '').trim();
+    if (!coachId) return res.status(400).json({ error: 'missing coach' });
+    if (/^\d+$/.test(coachId)) coachId = 'gid://shopify/Metaobject/' + coachId;   // Liquid may send the bare number
     const cid = String(gid).split('/').pop();
-    const coach = (await listMetaobjects('coach')).find(c => c.id === coachId);
-    if (!coach) return res.status(404).json({ error: 'coach not found' });
+    const coaches = await listMetaobjects('coach');
+    const coach = coaches.find(c => c.id === coachId || c.id.split('/').pop() === coachId.split('/').pop());
+    if (!coach) return res.status(404).json({ error: 'coach not found: ' + coachId });
+    coachId = coach.id;
     if (coach.fields.customer === gid || coach.fields.customer_id === cid) return res.json({ ok: true, self: true });
 
     const now = new Date().toISOString();
@@ -1067,12 +1079,19 @@ app.post('/proxy/coach/book-click', async (req, res) => {
     ];
     if (pf.pillars) extra.push({ key: 'focus_pillars', value: pf.pillars });
 
-    let errs = await createMetaobject('client_assignment', core.concat(extra).filter(f => f.value !== ''));
-    if (errs.length) {
-      console.warn('[book-click] full create failed, retrying core fields:', errs);
-      errs = await createMetaobject('client_assignment', core.filter(f => f.value !== ''));
+    // Try richest → simplest, with and without the publishable capability,
+    // so a mismatch in the client_assignment definition doesn't block the match.
+    const full = core.concat(extra).filter(f => f.value !== '');
+    const basic = core.filter(f => f.value !== '');
+    const tries = [];
+    let errs = [];
+    for (const [fields, pub] of [[full, true], [full, false], [basic, true], [basic, false]]) {
+      errs = await createAssignment(fields, pub);
+      tries.push(errs.map(e => (e.field ? e.field.join('.') + ': ' : '') + e.message).join('; ') || 'ok');
+      if (!errs.length) break;
     }
-    if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+    console.log('[book-click]', name, '→', coach.fields.name, tries);
+    if (errs.length) return res.status(400).json({ error: tries.join(' | ') });
     res.json({ ok: true, created: true });
   } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
 });
