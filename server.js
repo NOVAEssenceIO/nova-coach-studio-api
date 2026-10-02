@@ -7,6 +7,7 @@
      GET  /proxy/coach/posts        → list recent village_post entries (JSON)
      POST /proxy/coach/comment         → create a "village_comment" on a post
      POST /proxy/coach/comment-delete  → delete your OWN comment
+     POST /proxy/coach/intake       → prospective member interest form (no login)
      POST /proxy/coach/library-add     → add a "library_item"  (COACHES ONLY)
      GET  /proxy/coach/library         → list library items (all members)
      POST /proxy/coach/library-delete  → delete your OWN library item (coaches)
@@ -21,6 +22,8 @@
      POST /proxy/coach/course-delete      → delete own course + its lessons
      POST /proxy/coach/lesson-save        → create/update a lesson in own course
      POST /proxy/coach/lesson-delete      → delete a lesson in own course
+     POST /proxy/coach/book-click         → member tapped a coach's Book button →
+                                            add/refresh her in that coach's My Clients
    v2 changes:
      • Finds records by fetching + filtering in code (no fragile search query
        on a GID, which was silently matching nothing).
@@ -942,6 +945,135 @@ app.post('/proxy/coach/lesson-delete', async (req, res) => {
     const errs = j.data?.metaobjectDelete?.userErrors;
     if (errs?.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
     res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ==========================================================================
+//  VILLAGE INTAKE  —  prospective founding members (NO login required)
+//  POST /proxy/coach/intake  { name, email, phone, city, pillar, wants[],
+//                              tier, contact, invited_by, note, website }
+//  Saves an "intake" metaobject. Optional email alert via Resend if
+//  RESEND_API_KEY + ALERT_EMAIL are set on Render.
+// ==========================================================================
+const _recentIntakes = new Map();   // email -> timestamp (dedupe double-taps)
+const clip = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
+
+app.post('/proxy/coach/intake', async (req, res) => {
+  if (!verifyProxy(req.query)) return res.status(401).json({ error: 'bad signature' });
+  try {
+    const b = req.body || {};
+    if (b.website) return res.json({ ok: true });            // honeypot: bots fill hidden field
+    const name  = clip(b.name, 120);
+    const email = clip(b.email, 160).toLowerCase();
+    if (!name) return res.status(400).json({ error: 'Please add your name.' });
+    if (!/^\S+@\S+\.\S+$/.test(email)) return res.status(400).json({ error: 'Please add a valid email address.' });
+
+    const last = _recentIntakes.get(email);
+    if (last && Date.now() - last < 10 * 60 * 1000) return res.json({ ok: true, duplicate: true });
+    _recentIntakes.set(email, Date.now());
+
+    const wants = Array.isArray(b.wants) ? b.wants.map(w => clip(w, 60)).slice(0, 12).join(', ') : clip(b.wants, 600);
+    const entry = {
+      name, email,
+      phone:        clip(b.phone, 40),
+      city:         clip(b.city, 80),
+      pillar:       clip(b.pillar, 40),
+      wants,
+      tier:         clip(b.tier, 60),
+      contact_pref: clip(b.contact, 20) || 'Text',
+      invited_by:   clip(b.invited_by, 160),
+      note:         clip(b.note, 2000),
+      status:       'new',
+      created_at:   new Date().toISOString()
+    };
+    const fields = Object.entries(entry).filter(([, v]) => v !== '').map(([key, value]) => ({ key, value }));
+    const errs = await createMetaobject('intake', fields);
+    if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+
+    if (process.env.RESEND_API_KEY && process.env.ALERT_EMAIL) {
+      const lines = [
+        `Name: ${entry.name}`, `Email: ${entry.email}`, `Phone: ${entry.phone || '—'}`,
+        `Town: ${entry.city || '—'}`, `Reach by: ${entry.contact_pref}`,
+        `Leaning toward: ${entry.tier || '—'}`, `Loudest right now: ${entry.pillar || '—'}`,
+        `Hoping to find: ${entry.wants || '—'}`, `Invited by: ${entry.invited_by || '—'}`,
+        '', entry.note ? 'Note:\n' + entry.note : '',
+        '', 'Reply within 48 hours — that was the promise.'
+      ];
+      fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+        body: JSON.stringify({
+          from: process.env.ALERT_FROM || 'NOVA Village <onboarding@resend.dev>',
+          to: process.env.ALERT_EMAIL,
+          subject: `New founding member interest: ${entry.name}${entry.tier ? ' — ' + entry.tier : ''}`,
+          text: lines.join('\n')
+        })
+      }).catch(e => console.error('[intake alert]', e));
+    }
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ==========================================================================
+//  BOOKING MATCH — a member taps "Book a session" on a coach card in the
+//  Coaches directory → she appears in that coach's My Clients
+//  (client_assignment). One row per member + coach; repeat taps just refresh
+//  last_booking_click. Needs client_assignment fields: customer_id, source,
+//  last_booking_click (single line text).
+// ==========================================================================
+const TIER_BY_TAG = [['nourished_membership', 'Nourished'], ['empowered_membership', 'Empowered'], ['villager_membership', 'Villager']];
+
+app.post('/proxy/coach/book-click', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const coachId = String(req.body.coach || '');
+    if (!coachId.startsWith('gid://shopify/Metaobject/')) return res.status(400).json({ error: 'missing coach' });
+    const cid = String(gid).split('/').pop();
+    const coach = (await listMetaobjects('coach')).find(c => c.id === coachId);
+    if (!coach) return res.status(404).json({ error: 'coach not found' });
+    if (coach.fields.customer === gid || coach.fields.customer_id === cid) return res.json({ ok: true, self: true });
+
+    const now = new Date().toISOString();
+    const rows = await listMetaobjects('client_assignment');
+    const existing = rows.find(a => a.fields.coach === coachId && a.fields.customer_id === cid);
+    if (existing) {
+      await updateMetaobject(existing.id, [{ key: 'last_booking_click', value: now }]);
+      return res.json({ ok: true, existing: true });
+    }
+
+    const j = await admin(`query($id:ID!){ customer(id:$id){ displayName email tags } }`, { id: gid });
+    const c = j.data?.customer || {};
+    const tags = (c.tags || []).map(t => String(t).toLowerCase());
+    const tier = (TIER_BY_TAG.find(([t]) => tags.includes(t)) || [null, 'Member'])[1];
+    const prof = await findByCustomer('member_profile', gid);
+    const pf = prof?.fields || {};
+    const name = (pf.display_name || c.displayName || 'Villager').trim();
+    const day = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+
+    const core = [
+      { key: 'coach',       value: coachId },
+      { key: 'customer_id', value: cid },
+      { key: 'member_name', value: name },
+      { key: 'member_email', value: c.email || '' }
+    ];
+    const extra = [
+      { key: 'member_tier',  value: tier },
+      { key: 'member_photo', value: pf.photo_url || '' },
+      { key: 'source',       value: 'booking_link' },
+      { key: 'status',       value: 'New' },
+      { key: 'next_session', value: 'Not scheduled' },
+      { key: 'last_booking_click', value: now },
+      { key: 'note', value: `Tapped your booking link on ${day}.` }
+    ];
+    if (pf.pillars) extra.push({ key: 'focus_pillars', value: pf.pillars });
+
+    let errs = await createMetaobject('client_assignment', core.concat(extra).filter(f => f.value !== ''));
+    if (errs.length) {
+      console.warn('[book-click] full create failed, retrying core fields:', errs);
+      errs = await createMetaobject('client_assignment', core.filter(f => f.value !== ''));
+    }
+    if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+    res.json({ ok: true, created: true });
   } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
 });
 
