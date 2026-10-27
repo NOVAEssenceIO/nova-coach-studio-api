@@ -1030,7 +1030,7 @@ async function createAssignment(fields, publishable) {
   return j.data.metaobjectCreate?.userErrors || [];
 }
 
-const TIER_BY_TAG = [['nourished_membership', 'Nourished'], ['empowered_membership', 'Empowered'], ['villager_membership', 'Villager']];
+const TIER_BY_TAG = [['nourished_membership', 'Nourished'], ['empowered_membership', 'Empowered'], ['villager_membership', 'Villager'], ['explorer_membership', 'Explorer'], ['explorer', 'Explorer']];
 
 app.post('/proxy/coach/book-click', async (req, res) => {
   const gid = guard(req, res); if (!gid) return;
@@ -1093,6 +1093,119 @@ app.post('/proxy/coach/book-click', async (req, res) => {
     console.log('[book-click]', name, '→', coach.fields.name, tries);
     if (errs.length) return res.status(400).json({ error: tries.join(' | ') });
     res.json({ ok: true, created: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ==========================================================================
+//  SESSION CREDITS  —  1 credit = 1 class (any price). Expire monthly.
+//  Metaobject `credit_use`: customer_id, cycle (YYYY-MM), product_handle,
+//  code, status (pending|used), created_at.
+//  Scopes: read_products, read_discounts, write_discounts.
+// ==========================================================================
+const CREDIT_ALLOWANCE = { Explorer: 0, Villager: 2, Empowered: 6, Nourished: Infinity, Member: 0 };
+const MEMBER_DISCOUNT  = { Explorer: 0, Villager: 10, Empowered: 15, Nourished: 30, Member: 0 };
+const CODE_HOURS = 48;
+
+function tierFromTags(tags) {
+  const t = tags.join(',');
+  if (t.includes('nourished')) return 'Nourished';
+  if (t.includes('empowered')) return 'Empowered';
+  if (t.includes('villager') || t.includes('pocket of peace')) return 'Villager';
+  if (t.includes('explorer')) return 'Explorer';
+  return 'Member';
+}
+const cycleKey = (d = new Date()) => d.toISOString().slice(0, 7);
+function nextReset() {
+  const d = new Date(); return new Date(d.getFullYear(), d.getMonth() + 1, 1)
+    .toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+}
+
+async function codeUsed(code) {
+  const j = await admin(`query($c:String!){ codeDiscountNodeByCode(code:$c){ codeDiscount{ ... on DiscountCodeBasic { asyncUsageCount } } } }`, { c: code });
+  return (j.data?.codeDiscountNodeByCode?.codeDiscount?.asyncUsageCount || 0) > 0;
+}
+
+// Returns { tier, allowance, used, rows } with pending codes refreshed.
+async function creditState(gid) {
+  const cid = String(gid).split('/').pop();
+  const tier = tierFromTags(await getCustomerTags(gid));
+  const cycle = cycleKey();
+  const all = await listMetaobjects('credit_use');
+  const rows = all.filter(r => r.fields.customer_id === cid && r.fields.cycle === cycle);
+  const now = Date.now();
+  let used = 0;
+  for (const r of rows) {
+    if (r.fields.status !== 'used' && r.fields.code && await codeUsed(r.fields.code)) {
+      await updateMetaobject(r.id, [{ key: 'status', value: 'used' }]);
+      r.fields.status = 'used';
+    }
+    r.live = r.fields.status === 'pending' && now - Date.parse(r.fields.created_at) < CODE_HOURS * 3600e3;
+    if (r.fields.status === 'used' || r.live) used++;
+  }
+  return { tier, allowance: CREDIT_ALLOWANCE[tier], used, rows, cycle, cid };
+}
+
+// ---- GET /proxy/coach/credits → balance for the portal header
+app.get('/proxy/coach/credits', async (req, res) => {
+  if (!verifyProxy(req.query)) return res.status(401).json({ error: 'bad signature' });
+  const cid = req.query.logged_in_customer_id;
+  if (!cid) return res.status(401).json({ error: 'not logged in' });
+  try {
+    const s = await creditState(`gid://shopify/Customer/${cid}`);
+    const unlimited = s.allowance === Infinity;
+    res.json({ tier: s.tier, unlimited, total: unlimited ? null : s.allowance,
+      used: s.used, left: unlimited ? null : Math.max(0, s.allowance - s.used),
+      discount: MEMBER_DISCOUNT[s.tier], resets: nextReset() });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ---- POST /proxy/coach/credit-redeem { product: handle } → { url }
+app.post('/proxy/coach/credit-redeem', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const handle = String(req.body.product || '').trim().toLowerCase();
+    if (!handle) return res.status(400).json({ error: 'missing product' });
+    const back = `/products/${encodeURIComponent(handle)}`;
+    const s = await creditState(gid);
+
+    const again = s.rows.find(r => r.live && r.fields.product_handle === handle);
+    if (again) return res.json({ ok: true, reused: true, url: `/discount/${again.fields.code}?redirect=${back}` });
+
+    if (s.allowance !== Infinity && s.used >= s.allowance) {
+      return res.json({ ok: false, out: true, discount: MEMBER_DISCOUNT[s.tier], resets: nextReset(), url: back });
+    }
+
+    const pj = await admin(`query($h:String!){ productByHandle(handle:$h){ id title priceRangeV2{ maxVariantPrice{ amount } } } }`, { h: handle });
+    const p = pj.data?.productByHandle;
+    if (!p) return res.status(404).json({ error: 'class not found: ' + handle });
+    const amount = String(p.priceRangeV2.maxVariantPrice.amount);
+
+    const code = 'VCR-' + s.cid.slice(-4) + '-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+    const base = {
+      title: `Village credit · ${p.title} · ${s.cid}`,
+      code, startsAt: new Date().toISOString(),
+      endsAt: new Date(Date.now() + CODE_HOURS * 3600e3).toISOString(),
+      usageLimit: 1, appliesOncePerCustomer: true,
+      customerGets: { value: { discountAmount: { amount, appliesOnEachItem: false } }, items: { products: { productsToAdd: [p.id] } } },
+      combinesWith: { orderDiscounts: false, productDiscounts: false, shippingDiscounts: true }
+    };
+    const M = `mutation($d:DiscountCodeBasicInput!){ discountCodeBasicCreate(basicCodeDiscount:$d){ userErrors{ field message } } }`;
+    let j = await admin(M, { d: { ...base, context: { customers: { add: [gid] } } } });
+    let errs = j.data?.discountCodeBasicCreate?.userErrors || (j.errors || []);
+    if (errs.length) {   // older API shape fallback
+      j = await admin(M, { d: { ...base, customerSelection: { customers: { add: [gid] } } } });
+      errs = j.data?.discountCodeBasicCreate?.userErrors || (j.errors || []);
+    }
+    if (errs.length) { console.error('[credit-redeem]', errs); return res.status(400).json({ error: errs.map(e => e.message).join('; ') }); }
+
+    const mErr = await createMetaobject('credit_use', [
+      { key: 'customer_id', value: s.cid }, { key: 'cycle', value: s.cycle },
+      { key: 'product_handle', value: handle }, { key: 'code', value: code },
+      { key: 'status', value: 'pending' }, { key: 'created_at', value: new Date().toISOString() }
+    ]);
+    if (mErr.length) console.error('[credit_use]', mErr);
+    res.json({ ok: true, url: `/discount/${code}?redirect=${back}`,
+      left: s.allowance === Infinity ? null : s.allowance - s.used - 1 });
   } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
 });
 
