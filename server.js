@@ -1105,6 +1105,8 @@ app.post('/proxy/coach/book-click', async (req, res) => {
 const CREDIT_ALLOWANCE = { Explorer: 0, Villager: 2, Empowered: 6, Nourished: Infinity, Member: 0 };
 const MEMBER_DISCOUNT  = { Explorer: 0, Villager: 10, Empowered: 15, Nourished: 30, Member: 0 };
 const CODE_HOURS = 48;
+// Classes that never use a credit (match against product handle or title)
+const NO_CREDIT = [/art[-\s]of[-\s]loving/i, /date[-\s]?night/i];
 
 function tierFromTags(tags) {
   const t = tags.join(',');
@@ -1171,6 +1173,7 @@ app.post('/proxy/coach/credit-redeem', async (req, res) => {
     const again = s.rows.find(r => r.live && r.fields.product_handle === handle);
     if (again) return res.json({ ok: true, reused: true, url: `/discount/${again.fields.code}?redirect=${back}` });
 
+    if (NO_CREDIT.some(rx => rx.test(handle))) return res.json({ ok: false, noCredit: true, url: back });
     if (s.allowance !== Infinity && s.used >= s.allowance) {
       return res.json({ ok: false, out: true, discount: MEMBER_DISCOUNT[s.tier], resets: nextReset(), url: back });
     }
@@ -1178,6 +1181,7 @@ app.post('/proxy/coach/credit-redeem', async (req, res) => {
     const pj = await admin(`query($h:String!){ productByHandle(handle:$h){ id title priceRangeV2{ maxVariantPrice{ amount } } } }`, { h: handle });
     const p = pj.data?.productByHandle;
     if (!p) return res.status(404).json({ error: 'class not found: ' + handle });
+    if (NO_CREDIT.some(rx => rx.test(handle) || rx.test(p.title))) return res.json({ ok: false, noCredit: true, url: back });
     const amount = String(p.priceRangeV2.maxVariantPrice.amount);
 
     const code = 'VCR-' + s.cid.slice(-4) + '-' + Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -1186,7 +1190,7 @@ app.post('/proxy/coach/credit-redeem', async (req, res) => {
       code, startsAt: new Date().toISOString(),
       endsAt: new Date(Date.now() + CODE_HOURS * 3600e3).toISOString(),
       usageLimit: 1, appliesOncePerCustomer: true,
-      customerGets: { value: { discountAmount: { amount, appliesOnEachItem: false } }, items: { products: { productsToAdd: [p.id] } } },
+      customerGets: { value: { discountAmount: { amount, appliesOnEachItem: false } }, items: { all: true } },
       combinesWith: { orderDiscounts: false, productDiscounts: false, shippingDiscounts: true }
     };
     const M = `mutation($d:DiscountCodeBasicInput!){ discountCodeBasicCreate(basicCodeDiscount:$d){ userErrors{ field message } } }`;
