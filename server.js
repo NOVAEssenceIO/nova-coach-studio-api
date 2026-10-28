@@ -209,14 +209,17 @@ app.post('/proxy/coach/post', async (req, res) => {
   const gid = guard(req, res); if (!gid) return;
   try {
     const body = String(req.body.body ?? '').trim().slice(0, 2000);
-    if (!body) return res.status(400).json({ error: 'empty post' });
+    let image = String(req.body.image_url ?? '').trim();
+    if (image && !/^https:\/\/cdn\.shopify\.com\//.test(image)) image = '';   // only our own uploads
+    if (!body && !image) return res.status(400).json({ error: 'empty post' });
     const authorName = await getCustomerName(gid);
     const fields = [
       { key: 'author',      value: gid },
       { key: 'author_name', value: authorName },
-      { key: 'body',        value: body },
+      { key: 'body',        value: body || ' ' },
       { key: 'created_at',  value: new Date().toISOString() }
     ];
+    if (image) fields.push({ key: 'image_url', value: image });
     const errs = await createMetaobject('village_post', fields);
     if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
     res.json({ ok: true, author_name: authorName });
@@ -245,7 +248,8 @@ app.get('/proxy/coach/posts', async (req, res) => {
     res.json({ ok: true, posts: all.slice(0, 50).map(p => ({
       id: p.id,
       author_name: p.fields.author_name || 'Villager',
-      body: p.fields.body || '',
+      body: (p.fields.body || '').trim(),
+      image_url: p.fields.image_url || '',
       created_at: p.fields.created_at || '',
       mine: !!me && p.fields.author === me,
       comments: (byPost[p.id] || []).map(c => ({
