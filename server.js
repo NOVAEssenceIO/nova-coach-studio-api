@@ -1191,7 +1191,7 @@ app.post('/proxy/coach/credit-redeem', async (req, res) => {
       endsAt: new Date(Date.now() + CODE_HOURS * 3600e3).toISOString(),
       usageLimit: 1, appliesOncePerCustomer: true,
       customerGets: { value: { discountAmount: { amount, appliesOnEachItem: false } }, items: { all: true } },
-      combinesWith: { orderDiscounts: false, productDiscounts: false, shippingDiscounts: true }
+      combinesWith: { orderDiscounts: true, productDiscounts: true, shippingDiscounts: true }
     };
     const M = `mutation($d:DiscountCodeBasicInput!){ discountCodeBasicCreate(basicCodeDiscount:$d){ userErrors{ field message } } }`;
     let j = await admin(M, { d: { ...base, context: { customers: { add: [gid] } } } });
