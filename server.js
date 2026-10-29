@@ -1292,6 +1292,126 @@ app.post('/proxy/coach/room-note-delete', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ==========================================================================
+//  LIVING ROOM CHAT — served from memory (fast polling), saved to room_chat
+//  room_chat fields: author, author_name, created_at (single line), text (multi-line)
+// ==========================================================================
+let CHAT = [], CHAT_DAY = '', CHAT_LOADED = false;
+async function chatToday() {
+  const since = nyMidnightISO();
+  if (CHAT_DAY !== since) { CHAT = CHAT.filter(m => m.created_at >= since); CHAT_DAY = since; }
+  if (!CHAT_LOADED) {
+    CHAT_LOADED = true;
+    try {
+      const have = new Set(CHAT.map(m => m.id));
+      (await listMetaobjects('room_chat')).filter(n => String(n.fields.created_at || '') >= since).forEach(n => {
+        if (!have.has(n.id)) CHAT.push({ id: n.id, author: n.fields.author, name: n.fields.author_name || 'Villager', text: n.fields.text || '', created_at: n.fields.created_at });
+      });
+      CHAT.sort((a, b) => a.created_at.localeCompare(b.created_at));
+    } catch (e) { CHAT_LOADED = false; console.error('[room-chat load]', e); }
+  }
+  return CHAT;
+}
+const chatOut = (m, me) => ({ id: m.id, name: m.name, text: m.text, created_at: m.created_at, mine: !!me && m.author === me });
+
+app.get('/proxy/coach/room-chat', async (req, res) => {
+  if (!verifyProxy(req.query)) return res.status(401).json({ error: 'bad signature' });
+  const me = req.query.logged_in_customer_id ? `gid://shopify/Customer/${req.query.logged_in_customer_id}` : null;
+  if (!me) return res.status(401).json({ error: 'not logged in' });
+  try {
+    const after = String(req.query.after || '');
+    const list = (await chatToday()).filter(m => !after || m.created_at > after).slice(-150);
+    res.json({ ok: true, messages: list.map(m => chatOut(m, me)) });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.post('/proxy/coach/room-chat-send', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const text = String(req.body.text ?? '').trim().slice(0, 500);
+    if (!text) return res.status(400).json({ error: 'empty message' });
+    await chatToday();
+    const name = ROOM.get(gid)?.name || await getCustomerName(gid);
+    const m = { id: 'c' + Date.now() + Math.random().toString(36).slice(2, 6), author: gid, name, text, created_at: new Date().toISOString() };
+    CHAT.push(m); if (CHAT.length > 400) CHAT = CHAT.slice(-400);
+    createMetaobject('room_chat', [
+      { key: 'author', value: gid }, { key: 'author_name', value: name },
+      { key: 'text', value: text }, { key: 'created_at', value: m.created_at }
+    ]).then(errs => { if (errs.length) console.error('[room_chat]', errs); }).catch(e => console.error('[room_chat]', e));
+    res.json({ ok: true, message: chatOut(m, gid) });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+// ==========================================================================
+//  LIVING ROOM PRAYER BOX — room_prayer
+//  single line: author, author_name, scope (village|team), anon (true|false), created_at
+//  multi-line:  text, praying (comma list of customer ids)
+// ==========================================================================
+const prayingList = p => String(p.fields.praying || '').split(',').map(s => s.trim()).filter(Boolean);
+
+app.get('/proxy/coach/room-prayers', async (req, res) => {
+  if (!verifyProxy(req.query)) return res.status(401).json({ error: 'bad signature' });
+  const cid = req.query.logged_in_customer_id;
+  if (!cid) return res.status(401).json({ error: 'not logged in' });
+  const me = `gid://shopify/Customer/${cid}`;
+  try {
+    const since = new Date(Date.now() - 7 * 864e5).toISOString();
+    const all = (await listMetaobjects('room_prayer')).filter(p => p.fields.scope !== 'team' && String(p.fields.created_at || '') >= since);
+    all.sort((a, b) => String(b.fields.created_at || '').localeCompare(String(a.fields.created_at || '')));
+    res.json({ ok: true, prayers: all.slice(0, 30).map(p => {
+      const list = prayingList(p);
+      return { id: p.id, name: p.fields.anon === 'true' ? 'A Villager' : (p.fields.author_name || 'Villager'),
+        text: (p.fields.text || '').trim(), created_at: p.fields.created_at || '',
+        count: list.length, prayed: list.includes(String(cid)), mine: p.fields.author === me };
+    }) });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.post('/proxy/coach/room-prayer', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const text = String(req.body.text ?? '').trim().slice(0, 300);
+    if (!text) return res.status(400).json({ error: 'empty request' });
+    const scope = req.body.scope === 'team' ? 'team' : 'village';
+    const errs = await createMetaobject('room_prayer', [
+      { key: 'author', value: gid }, { key: 'author_name', value: await getCustomerName(gid) },
+      { key: 'text', value: text }, { key: 'scope', value: scope },
+      { key: 'anon', value: scope === 'village' && req.body.anon ? 'true' : 'false' },
+      { key: 'created_at', value: new Date().toISOString() }
+    ]);
+    if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+    res.json({ ok: true, scope });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.post('/proxy/coach/room-pray', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const cid = String(gid).split('/').pop(), id = String(req.body.id || '');
+    const p = (await listMetaobjects('room_prayer')).find(x => x.id === id && x.fields.scope !== 'team');
+    if (!p) return res.status(404).json({ error: 'prayer not found' });
+    let list = prayingList(p);
+    list = list.includes(cid) ? list.filter(x => x !== cid) : list.concat(cid);
+    const errs = await updateMetaobject(p.id, [{ key: 'praying', value: list.join(',') || ' ' }]);
+    if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+    res.json({ ok: true, count: list.length, prayed: list.includes(cid) });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.post('/proxy/coach/room-prayer-delete', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const id = String(req.body.id || '');
+    const p = (await listMetaobjects('room_prayer')).find(x => x.id === id);
+    if (!p) return res.status(404).json({ error: 'prayer not found' });
+    if (p.fields.author !== gid) return res.status(403).json({ error: 'not your request' });
+    const j = await admin(`mutation($id:ID!){ metaobjectDelete(id:$id){ deletedId userErrors{message} } }`, { id });
+    const errs = j.data?.metaobjectDelete?.userErrors;
+    if (errs?.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ---- health check ---------------------------------------------------------
 app.get('/', (_req, res) => res.send('NOVA Coach Studio API is running.'));
 
