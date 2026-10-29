@@ -1217,6 +1217,81 @@ app.post('/proxy/coach/credit-redeem', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
 });
 
+// ==========================================================================
+//  LIVING ROOM — who's here (in memory) + daily board notes (room_note)
+//  room_note fields: author, author_name, text, tone, image_url, created_at
+// ==========================================================================
+const ROOM = new Map();               // customer gid -> { name, ts }
+const ROOM_TTL = 2.5 * 60 * 1000;     // gone after 2.5 min without a ping
+const ROOM_TONES = ['sage', 'sand', 'mist', 'blush', 'ink'];
+function nyMidnightISO() {
+  const now = new Date();
+  const ny = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const mid = new Date(ny.getFullYear(), ny.getMonth(), ny.getDate());
+  return new Date(mid.getTime() + (now - ny)).toISOString();
+}
+
+app.post('/proxy/coach/room-ping', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    if (req.body && req.body.leave) ROOM.delete(gid);
+    else {
+      const prev = ROOM.get(gid);
+      ROOM.set(gid, { name: prev?.name || await getCustomerName(gid), ts: Date.now() });
+    }
+    const now = Date.now(), here = [];
+    for (const [k, v] of ROOM) { if (now - v.ts > ROOM_TTL) ROOM.delete(k); else here.push({ name: v.name, me: k === gid }); }
+    res.json({ ok: true, here });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.get('/proxy/coach/room-notes', async (req, res) => {
+  if (!verifyProxy(req.query)) return res.status(401).json({ error: 'bad signature' });
+  const me = req.query.logged_in_customer_id ? `gid://shopify/Customer/${req.query.logged_in_customer_id}` : null;
+  try {
+    const since = nyMidnightISO();
+    const all = (await listMetaobjects('room_note')).filter(n => String(n.fields.created_at || '') >= since);
+    all.sort((a, b) => String(b.fields.created_at || '').localeCompare(String(a.fields.created_at || '')));
+    res.json({ ok: true, notes: all.slice(0, 40).map(n => ({
+      id: n.id, name: n.fields.author_name || 'Villager', text: n.fields.text || '', tone: n.fields.tone || 'sage',
+      image_url: n.fields.image_url || '', created_at: n.fields.created_at || '', mine: !!me && n.fields.author === me })) });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.post('/proxy/coach/room-note', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const text = String(req.body.text ?? '').trim().slice(0, 120);
+    const tone = ROOM_TONES.includes(req.body.tone) ? req.body.tone : 'sage';
+    let image = String(req.body.image_url ?? '').trim();
+    if (image && !/^https:\/\/cdn\.shopify\.com\//.test(image)) image = '';
+    if (!text && !image) return res.status(400).json({ error: 'empty note' });
+    const fields = [
+      { key: 'author', value: gid }, { key: 'author_name', value: await getCustomerName(gid) },
+      { key: 'text', value: text || ' ' }, { key: 'tone', value: tone },
+      { key: 'created_at', value: new Date().toISOString() }
+    ];
+    if (image) fields.push({ key: 'image_url', value: image });
+    const errs = await createMetaobject('room_note', fields);
+    if (errs.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
+app.post('/proxy/coach/room-note-delete', async (req, res) => {
+  const gid = guard(req, res); if (!gid) return;
+  try {
+    const id = String(req.body.id || '');
+    const n = (await listMetaobjects('room_note')).find(x => x.id === id);
+    if (!n) return res.status(404).json({ error: 'note not found' });
+    if (n.fields.author !== gid) return res.status(403).json({ error: 'not your note' });
+    const j = await admin(`mutation($id:ID!){ metaobjectDelete(id:$id){ deletedId userErrors{message} } }`, { id });
+    const errs = j.data?.metaobjectDelete?.userErrors;
+    if (errs?.length) return res.status(400).json({ error: errs.map(e => e.message).join('; ') });
+    res.json({ ok: true });
+  } catch (e) { console.error(e); res.status(500).json({ error: String(e.message || e) }); }
+});
+
 // ---- health check ---------------------------------------------------------
 app.get('/', (_req, res) => res.send('NOVA Coach Studio API is running.'));
 
